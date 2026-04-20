@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/4c957bd7-64e1-4a7e-9993-136740d911fe
 
 ## 更新记录
 
+- **[2026-04-14]** 发布训练脚本与可复现的演示 Notebook。
 - **[2026-04-09]** NeoVerse 被选为 **highlight** 论文！
 - **[2026-02-21]** NeoVerse 被 **CVPR 2026** 接收！
 - **[2026-02-16]** 已在 [Hugging Face](https://huggingface.co/Yuppie1204/NeoVerse) 和 [ModelScope](https://www.modelscope.cn/models/Yuppie1204/NeoVerse) 发布推理脚本与模型检查点。
@@ -34,6 +35,8 @@ https://github.com/user-attachments/assets/4c957bd7-64e1-4a7e-9993-136740d911fe
 - **交互式 Gradio Demo**：提供重建、轨迹设计和生成的分步式 Web UI
 - **支持多种重建器**：通过即插即用接口支持不同的 3D 重建器，例如 [Depth Anything 3](https://depth-anything-3.github.io/)
 - **推理速度快**：在单张 A800 上，使用蒸馏 LoRA 加速后，整套推理流程可在 30 秒内完成
+- **支持训练**：已发布控制分支训练代码，可在自有单目视频数据上进行微调
+- **演示 Notebook**：`docs/` 中提供可复现的下游应用 Notebook
 
 ## 安装
 
@@ -237,6 +240,45 @@ python inference.py \
 # 使用 Depth Anything 3 启动 Gradio Demo
 python app.py --reconstructor_path models/da3_giant_1.1.safetensors
 ```
+
+## Demo Notebook（持续补充中）
+
+我们在 [`docs/`](docs/) 中提供了可复现的 Jupyter Notebook，覆盖项目页展示的部分下游应用：
+
+| Notebook | 说明 |
+|----------|------|
+| [`docs/single_view_to_multi_view.ipynb`](docs/single_view_to_multi_view.ipynb) | 通过连续相机平移，将单视角视频逐步扩展为多视角序列 |
+| [`docs/video_editing.ipynb`](docs/video_editing.ipynb) | 在保持周围场景一致的前提下，按文本提示编辑视频中的掩码区域 |
+| [`docs/camera_stabilization.ipynb`](docs/camera_stabilization.ipynb) | 结合 SLERP 与高斯滤波平滑恢复轨迹，实现手持视频稳像 |
+
+**说明：** 如果你要做更强的反事实编辑，建议先用 [VACE](https://github.com/ali-vilab/VACE) 这类专业视频编辑模型在单视角视频上完成编辑，再按 [`docs/single_view_to_multi_view.ipynb`](docs/single_view_to_multi_view.ipynb) 的方式送入 NeoVerse 生成多视角或新视角结果。
+
+## 训练
+
+我们发布了 NeoVerse 控制分支的训练代码，可用于在自有单目视频数据上继续微调。
+
+### 训练数据
+
+我们在 `data/SpatialVID/` 中提供了来自 [SpatialVID](https://huggingface.co/datasets/FelixYuan/SpatialVID-HQ) 的 20 段示例片段作为最小可运行示例。训练时**只需要 RGB 视频帧和文本提示**，不需要深度图、外参和内参；三维结构与相机位姿由重建器在线估计，因此可以较容易迁移到通用野外单目视频数据。
+
+### 基于 ZeRO-2 的多机训练
+
+训练脚本基于 [Accelerate](https://huggingface.co/docs/accelerate) 与 DeepSpeed ZeRO Stage 2，示例命令如下：
+
+```bash
+accelerate launch \
+    --use_deepspeed \
+    --deepspeed_config_file training/configs/zero_stage2_config.json \
+    --main_process_ip $MASTER_ADDR \
+    --main_process_port $MASTER_PORT \
+    --num_machines $WORLD_SIZE \
+    --num_processes $NUM_PROCESS \
+    --machine_rank $NODE_RANK \
+    --deepspeed_multinode_launcher standard \
+    train.py training/configs/train.yaml
+```
+
+训练配置（数据路径、学习率、batch size 等）见 [`training/configs/train.yaml`](training/configs/train.yaml)。
 
 ## 模型结构
 
