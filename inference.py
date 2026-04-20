@@ -1,11 +1,18 @@
 import torch
 import os
 import argparse
+import contextlib
 import numpy as np
 from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+from diffsynth.utils.static_dynamic_split import (
+    SplitConfig,
+    build_split_views,
+    run_split_reconstruction,
+    run_static_dynamic_split,
+)
 
 
 @torch.no_grad()
@@ -25,14 +32,17 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
         views["is_static"] = torch.zeros((1, len(input_video)), dtype=torch.bool, device=device)
         views["timestamp"] = torch.arange(0, len(input_video), dtype=torch.int64, device=device).unsqueeze(0)
 
-    # Low-VRAM: load reconstructor to GPU before use
     if pipe.vram_management_enabled:
         pipe.reconstructor.to(device)
 
-    with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
+    if str(device).startswith("cuda"):
+        autocast_ctx = torch.amp.autocast("cuda", dtype=pipe.torch_dtype)
+    else:
+        autocast_ctx = contextlib.nullcontext()
+
+    with autocast_ctx:
         predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
 
-    # Low-VRAM: offload reconstructor back to CPU
     if pipe.vram_management_enabled:
         pipe.reconstructor.cpu()
         torch.cuda.empty_cache()
@@ -157,6 +167,22 @@ def parse_args():
     parser.add_argument("--low_vram", action="store_true",
                         help="Enable low-VRAM mode with model offloading (reduces peak VRAM usage)")
 
+    # Optional static/dynamic split export
+    parser.add_argument("--export_static_dynamic_split", action="store_true",
+                        help="Export static/dynamic split artifacts after reconstruction")
+    parser.add_argument("--split_output_dir", default=None,
+                        help="Output directory for split artifacts")
+    parser.add_argument("--split_mode", choices=["auto", "motion", "mask"], default="auto",
+                        help="Split mode for static/dynamic export")
+    parser.add_argument("--mask_dir", default=None,
+                        help="Mask directory for split_mode=mask or split_mode=auto")
+    parser.add_argument("--split_alpha_threshold", type=float, default=0.05,
+                        help="Alpha threshold used in split exports")
+    parser.add_argument("--static_voxel_size", type=float, default=0.01,
+                        help="voxel size in neoverse_scene_unit")
+    parser.add_argument("--dynamic_voxel_size", type=float, default=0.01,
+                        help="voxel size in neoverse_scene_unit")
+
     return parser.parse_args()
 
 
@@ -216,12 +242,13 @@ def main():
 
     # Load model
     print(f"Loading model from {args.model_path}...")
+    pipe_device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = WanVideoNeoVersePipeline.from_pretrained(
         local_model_path=args.model_path,
         reconstructor_path=args.reconstructor_path,
         lora_path=lora_path,
         lora_alpha=1.0,
-        device="cuda",
+        device=pipe_device,
         torch_dtype=torch.bfloat16,
         enable_vram_management=args.low_vram,
     )
@@ -233,6 +260,41 @@ def main():
                         resolution=(args.width, args.height),
                         resize_mode=args.resize_mode,
                         static_scene=args.static_scene)
+
+    precomputed_views = None
+    precomputed_predictions = None
+    if args.export_static_dynamic_split:
+        if args.split_output_dir:
+            split_output_dir = args.split_output_dir
+        else:
+            split_output_dir = os.path.splitext(args.output_path)[0] + "_split"
+
+        precomputed_views = build_split_views(images=images, device=pipe.device, static_scene=args.static_scene)
+        precomputed_predictions = run_split_reconstruction(pipe=pipe, views=precomputed_views, use_motion=True)
+
+        print(f"Exporting static/dynamic split to {split_output_dir}...")
+        split_config = SplitConfig(
+            input_path=args.input_path,
+            output_dir=split_output_dir,
+            split_mode=args.split_mode,
+            mask_dir=args.mask_dir,
+            num_frames=args.num_frames,
+            width=args.width,
+            height=args.height,
+            resize_mode=args.resize_mode,
+            static_scene=args.static_scene,
+            alpha_threshold=args.split_alpha_threshold,
+            static_voxel_size=args.static_voxel_size,
+            dynamic_voxel_size=args.dynamic_voxel_size,
+        )
+        split_result = run_static_dynamic_split(
+            pipe=pipe,
+            config=split_config,
+            images=images,
+            views=precomputed_views,
+            predictions=precomputed_predictions,
+        )
+        print(f"Static/dynamic split done: {split_result['output_dir']}")
 
     # Run inference
     output_path = args.output_path
