@@ -294,6 +294,40 @@ class WanVideoNeoVersePipeline(BasePipeline):
         return pipe
 
 
+    @staticmethod
+    def from_reconstructor_only(
+        reconstructor_path: str = "models/NeoVerse/reconstructor.ckpt",
+        device: Union[str, torch.device] = "cuda",
+        torch_dtype: torch.dtype = torch.bfloat16,
+        enable_vram_management: bool = False,
+    ):
+        print(f"Loading NeoVerse reconstructor-only pipeline from {reconstructor_path}...")
+
+        pipe = WanVideoNeoVersePipeline(device=device, torch_dtype=torch_dtype)
+
+        model_manager = ModelManager()
+        model_manager.load_model(
+            reconstructor_path,
+            device="cpu" if enable_vram_management else device,
+            torch_dtype=torch_dtype,
+        )
+        pipe.reconstructor = model_manager.fetch_model("reconstructor")
+
+        if pipe.reconstructor is None:
+            raise RuntimeError(f"Failed to load reconstructor from {reconstructor_path}")
+
+        pipe.dit = None
+        pipe.text_encoder = None
+        pipe.vae = None
+        pipe.control_branch = None
+
+        if enable_vram_management:
+            pipe.vram_management_enabled = True
+
+        print("Loaded reconstructor-only pipeline.")
+        return pipe
+
+
     @torch.no_grad()
     def __call__(
         self,

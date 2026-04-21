@@ -102,7 +102,7 @@ def parse_args():
     )
 
     # Trajectory specification (mutually exclusive)
-    traj_group = parser.add_mutually_exclusive_group(required=True)
+    traj_group = parser.add_mutually_exclusive_group(required=False)
     traj_group.add_argument("--trajectory",
                             choices=["pan_left", "pan_right", "tilt_up", "tilt_down",
                                      "move_left", "move_right", "push_in", "pull_out",
@@ -127,6 +127,8 @@ def parse_args():
     # Validation only
     parser.add_argument("--validate_only", action="store_true",
                         help="Only validate trajectory file, don't run inference")
+    parser.add_argument("--split_only", action="store_true",
+                        help="Only export static/dynamic split artifacts without video generation")
 
     # Input/output
     parser.add_argument("--input_path", help="Input video or image path")
@@ -189,18 +191,11 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # --- LoRA / inference params ---
-    use_lora = not args.disable_lora
-    num_inference_steps = 4 if use_lora else 50
-    cfg_scale = 1.0 if use_lora else 5.0
-
-    lora_path = os.path.join(
-        args.model_path,
-        "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
-    ) if use_lora else None
-
     # --- Validate-only mode ---
     if args.validate_only:
+        if args.split_only:
+            print("Error: --validate_only cannot be used together with --split_only")
+            return 1
         if args.trajectory_file is None:
             print("Error: --validate_only requires --trajectory_file")
             return 1
@@ -218,10 +213,73 @@ def main():
             print(f"Validation failed: {e}")
             return 1
 
+    # --- Split-only mode ---
+    if args.split_only:
+        if not args.export_static_dynamic_split:
+            print("Error: --split_only requires --export_static_dynamic_split")
+            return 1
+        if args.input_path is None:
+            print("Error: --split_only requires --input_path")
+            return 1
+
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+
+        pipe_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Loading NeoVerse reconstructor-only pipeline from {args.reconstructor_path}...")
+        pipe = WanVideoNeoVersePipeline.from_reconstructor_only(
+            reconstructor_path=args.reconstructor_path,
+            device=pipe_device,
+            torch_dtype=torch.bfloat16,
+            enable_vram_management=args.low_vram,
+        )
+
+        print(f"Loading video from {args.input_path}...")
+        images = load_video(args.input_path, args.num_frames,
+                            resolution=(args.width, args.height),
+                            resize_mode=args.resize_mode,
+                            static_scene=args.static_scene)
+
+        if args.split_output_dir:
+            split_output_dir = args.split_output_dir
+        else:
+            split_output_dir = os.path.splitext(args.output_path)[0] + "_split"
+
+        split_config = SplitConfig(
+            input_path=args.input_path,
+            output_dir=split_output_dir,
+            split_mode=args.split_mode,
+            mask_dir=args.mask_dir,
+            num_frames=args.num_frames,
+            width=args.width,
+            height=args.height,
+            resize_mode=args.resize_mode,
+            static_scene=args.static_scene,
+            alpha_threshold=args.split_alpha_threshold,
+            static_voxel_size=args.static_voxel_size,
+            dynamic_voxel_size=args.dynamic_voxel_size,
+        )
+        split_result = run_static_dynamic_split(pipe=pipe, config=split_config, images=images)
+        print(f"Static/dynamic split done: {split_result['output_dir']}")
+        return 0
+
     # --- Normal inference mode ---
     if args.input_path is None:
         print("Error: --input_path is required for inference")
         return 1
+    if args.trajectory is None and args.trajectory_file is None:
+        print("Error: normal generation requires --trajectory or --trajectory_file")
+        return 1
+
+    # --- LoRA / inference params ---
+    use_lora = not args.disable_lora
+    num_inference_steps = 4 if use_lora else 50
+    cfg_scale = 1.0 if use_lora else 5.0
+
+    lora_path = os.path.join(
+        args.model_path,
+        "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
+    ) if use_lora else None
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

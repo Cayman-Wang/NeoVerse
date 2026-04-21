@@ -38,13 +38,10 @@ def main():
     from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
     from diffsynth.utils.static_dynamic_split import SplitConfig, run_static_dynamic_split
 
-    print(f"Loading NeoVerse pipeline from {args.model_path}...")
+    print(f"Loading NeoVerse reconstructor-only pipeline from {args.reconstructor_path}...")
 
-    pipe = WanVideoNeoVersePipeline.from_pretrained(
-        local_model_path=args.model_path,
+    pipe = WanVideoNeoVersePipeline.from_reconstructor_only(
         reconstructor_path=args.reconstructor_path,
-        lora_path=None,
-        lora_alpha=1.0,
         device="cuda" if torch.cuda.is_available() else "cpu",
         torch_dtype=torch.bfloat16,
         enable_vram_management=args.low_vram,
