@@ -2,9 +2,10 @@ import csv
 import contextlib
 import json
 import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -17,6 +18,13 @@ from ..auxiliary_models.worldmirror.models.models.rasterization import Gaussians
 
 STATIC_COLOR = np.array([160, 160, 160], dtype=np.float32)
 DYNAMIC_COLOR = np.array([255, 140, 0], dtype=np.float32)
+NEIGHBOR_OFFSETS_26 = [
+    (dx, dy, dz)
+    for dx in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if not (dx == 0 and dy == 0 and dz == 0)
+]
 
 
 @dataclass
@@ -35,6 +43,11 @@ class SplitConfig:
     dynamic_voxel_size: float = 0.01
     dynamic_threshold: float = 1e-4
     dynamic_threshold2: Optional[float] = None
+    dynamic_denoise_enabled: bool = False
+    dynamic_denoise_min_neighbors: int = 1
+    dynamic_denoise_min_cluster_size: int = 12
+    dynamic_denoise_temporal_min_frames: int = 1
+    dynamic_denoise_temporal_match_radius: float = 0.06
     enable_global_motion_tracking: bool = False
 
 
@@ -86,6 +99,199 @@ def configure_reconstructor_motion_split(pipe, config: SplitConfig) -> None:
 
 def _resolved_dynamic_threshold2(config: SplitConfig) -> float:
     return config.dynamic_threshold if config.dynamic_threshold2 is None else config.dynamic_threshold2
+
+
+def _connected_components_26(coords: np.ndarray) -> List[np.ndarray]:
+    if coords.shape[0] == 0:
+        return []
+
+    coord_to_idx: Dict[Tuple[int, int, int], int] = {
+        (int(c[0]), int(c[1]), int(c[2])): i for i, c in enumerate(coords)
+    }
+    visited = np.zeros(coords.shape[0], dtype=bool)
+    components: List[np.ndarray] = []
+
+    for start in range(coords.shape[0]):
+        if visited[start]:
+            continue
+        visited[start] = True
+        q = deque([start])
+        comp_indices: List[int] = []
+        while q:
+            idx = q.popleft()
+            comp_indices.append(idx)
+            x, y, z = coords[idx]
+            for dx, dy, dz in NEIGHBOR_OFFSETS_26:
+                neighbor = (int(x + dx), int(y + dy), int(z + dz))
+                n_idx = coord_to_idx.get(neighbor)
+                if n_idx is None or visited[n_idx]:
+                    continue
+                visited[n_idx] = True
+                q.append(n_idx)
+        components.append(np.asarray(comp_indices, dtype=np.int64))
+
+    return components
+
+
+def _spatial_denoise_frame(
+    points: np.ndarray,
+    dynamic_voxel_size: float,
+    min_neighbors: int,
+    min_cluster_size: int,
+) -> Tuple[np.ndarray, List[dict]]:
+    if points.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32), []
+    if dynamic_voxel_size <= 0:
+        centroid = np.mean(points, axis=0).astype(np.float32)
+        return points.astype(np.float32), [{"points": points.astype(np.float32), "centroid": centroid}]
+
+    coords = np.floor(points / dynamic_voxel_size).astype(np.int64)
+    unique_coords, unique_idx = np.unique(coords, axis=0, return_index=True)
+    unique_points = points[unique_idx].astype(np.float32)
+
+    occupied: Set[Tuple[int, int, int]] = {
+        (int(c[0]), int(c[1]), int(c[2])) for c in unique_coords
+    }
+    neighbor_counts = np.zeros(unique_coords.shape[0], dtype=np.int32)
+    for i, (x, y, z) in enumerate(unique_coords):
+        cnt = 0
+        for dx, dy, dz in NEIGHBOR_OFFSETS_26:
+            if (int(x + dx), int(y + dy), int(z + dz)) in occupied:
+                cnt += 1
+        neighbor_counts[i] = cnt
+
+    keep_neighbor_mask = neighbor_counts >= max(0, int(min_neighbors))
+    if not np.any(keep_neighbor_mask):
+        return np.zeros((0, 3), dtype=np.float32), []
+
+    kept_coords = unique_coords[keep_neighbor_mask]
+    kept_points = unique_points[keep_neighbor_mask]
+    components = _connected_components_26(kept_coords)
+
+    cluster_size_threshold = max(1, int(min_cluster_size))
+    kept_clusters: List[dict] = []
+    kept_points_chunks: List[np.ndarray] = []
+    for comp in components:
+        if comp.size < cluster_size_threshold:
+            continue
+        cluster_points = kept_points[comp].astype(np.float32)
+        kept_points_chunks.append(cluster_points)
+        kept_clusters.append(
+            {
+                "points": cluster_points,
+                "centroid": np.mean(cluster_points, axis=0).astype(np.float32),
+            }
+        )
+
+    if not kept_points_chunks:
+        return np.zeros((0, 3), dtype=np.float32), []
+    return np.concatenate(kept_points_chunks, axis=0).astype(np.float32), kept_clusters
+
+
+def _temporal_filter_clusters(
+    clusters_per_frame: List[List[dict]],
+    temporal_min_frames: int,
+    temporal_match_radius: float,
+) -> List[np.ndarray]:
+    frame_count = len(clusters_per_frame)
+    if frame_count == 0:
+        return []
+    if temporal_min_frames <= 1:
+        result: List[np.ndarray] = []
+        for frame_clusters in clusters_per_frame:
+            if not frame_clusters:
+                result.append(np.zeros((0, 3), dtype=np.float32))
+                continue
+            result.append(np.concatenate([c["points"] for c in frame_clusters], axis=0).astype(np.float32))
+        return result
+
+    tracks: List[List[Tuple[int, int]]] = []
+    for cluster_idx in range(len(clusters_per_frame[0])):
+        tracks.append([(0, cluster_idx)])
+
+    radius = float(temporal_match_radius)
+    radius2 = radius * radius
+
+    for frame_idx in range(1, frame_count):
+        prev_active_track_ids = [
+            track_id
+            for track_id, track in enumerate(tracks)
+            if track and track[-1][0] == frame_idx - 1
+        ]
+        current_clusters = clusters_per_frame[frame_idx]
+
+        candidates: List[Tuple[float, int, int]] = []
+        for track_id in prev_active_track_ids:
+            prev_frame, prev_cluster_idx = tracks[track_id][-1]
+            prev_centroid = clusters_per_frame[prev_frame][prev_cluster_idx]["centroid"]
+            for cluster_idx, cluster in enumerate(current_clusters):
+                delta = cluster["centroid"] - prev_centroid
+                dist2 = float(np.dot(delta, delta))
+                if dist2 <= radius2:
+                    candidates.append((dist2, track_id, cluster_idx))
+
+        candidates.sort(key=lambda x: x[0])
+        matched_track_ids: Set[int] = set()
+        matched_cluster_ids: Set[int] = set()
+
+        for _, track_id, cluster_idx in candidates:
+            if track_id in matched_track_ids or cluster_idx in matched_cluster_ids:
+                continue
+            tracks[track_id].append((frame_idx, cluster_idx))
+            matched_track_ids.add(track_id)
+            matched_cluster_ids.add(cluster_idx)
+
+        for cluster_idx in range(len(current_clusters)):
+            if cluster_idx not in matched_cluster_ids:
+                tracks.append([(frame_idx, cluster_idx)])
+
+    keep_cluster = [
+        np.zeros(len(frame_clusters), dtype=bool)
+        for frame_clusters in clusters_per_frame
+    ]
+    for track in tracks:
+        if len(track) < int(temporal_min_frames):
+            continue
+        for frame_idx, cluster_idx in track:
+            keep_cluster[frame_idx][cluster_idx] = True
+
+    filtered_points_per_frame: List[np.ndarray] = []
+    for frame_idx, frame_clusters in enumerate(clusters_per_frame):
+        if not frame_clusters:
+            filtered_points_per_frame.append(np.zeros((0, 3), dtype=np.float32))
+            continue
+        chunks = [
+            frame_clusters[cluster_idx]["points"]
+            for cluster_idx in range(len(frame_clusters))
+            if keep_cluster[frame_idx][cluster_idx]
+        ]
+        if chunks:
+            filtered_points_per_frame.append(np.concatenate(chunks, axis=0).astype(np.float32))
+        else:
+            filtered_points_per_frame.append(np.zeros((0, 3), dtype=np.float32))
+
+    return filtered_points_per_frame
+
+
+def _denoise_dynamic_points_per_frame(
+    dynamic_points_per_frame: Sequence[np.ndarray],
+    config: SplitConfig,
+) -> List[np.ndarray]:
+    spatial_clusters_per_frame: List[List[dict]] = []
+    for points in dynamic_points_per_frame:
+        _, clusters = _spatial_denoise_frame(
+            points=points,
+            dynamic_voxel_size=config.dynamic_voxel_size,
+            min_neighbors=config.dynamic_denoise_min_neighbors,
+            min_cluster_size=config.dynamic_denoise_min_cluster_size,
+        )
+        spatial_clusters_per_frame.append(clusters)
+
+    return _temporal_filter_clusters(
+        clusters_per_frame=spatial_clusters_per_frame,
+        temporal_min_frames=config.dynamic_denoise_temporal_min_frames,
+        temporal_match_radius=config.dynamic_denoise_temporal_match_radius,
+    )
 
 
 def _static_classification_label(config: SplitConfig) -> str:
@@ -527,6 +733,24 @@ def _split_mask(
     return static_points, dynamic_points_per_frame, dynamic_gaussians_per_frame, index_rows, static_candidates
 
 
+def _pad_frame_to_macro_block(frame: Image.Image, macro_block_size: int = 16) -> Image.Image:
+    if macro_block_size <= 1:
+        return frame.convert("RGB")
+
+    rgb = frame.convert("RGB")
+    width, height = rgb.size
+    padded_width = ((width + macro_block_size - 1) // macro_block_size) * macro_block_size
+    padded_height = ((height + macro_block_size - 1) // macro_block_size) * macro_block_size
+    if padded_width == width and padded_height == height:
+        return rgb
+
+    arr = np.array(rgb, dtype=np.uint8)
+    pad_w = padded_width - width
+    pad_h = padded_height - height
+    arr = np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    return Image.fromarray(arr)
+
+
 def _save_preview_frames(frames: Sequence[Image.Image], output_preview_path: Path) -> str:
     _ensure_dir(output_preview_path.parent)
     if len(frames) == 1:
@@ -537,7 +761,8 @@ def _save_preview_frames(frames: Sequence[Image.Image], output_preview_path: Pat
     from .. import save_video
 
     path = output_preview_path.with_suffix(".mp4")
-    save_video(list(frames), str(path), fps=16)
+    padded_frames = [_pad_frame_to_macro_block(frame, macro_block_size=16) for frame in frames]
+    save_video(padded_frames, str(path), fps=16)
     return str(path)
 
 
@@ -693,6 +918,23 @@ def run_static_dynamic_split(
             _save_torch(dyn_gaussian_root / f"{frame_idx:06d}.pt", dynamic_snapshot)
         gaussian_export_mode = "mask_snapshot_audit"
 
+    dynamic_points_total_raw = int(sum(points.shape[0] for points in dynamic_points_per_frame))
+    if config.dynamic_denoise_enabled:
+        dynamic_points_per_frame = _denoise_dynamic_points_per_frame(dynamic_points_per_frame, config)
+        dynamic_points_total_filtered = int(sum(points.shape[0] for points in dynamic_points_per_frame))
+        removed = dynamic_points_total_raw - dynamic_points_total_filtered
+        print(
+            f"Dynamic denoise: raw={dynamic_points_total_raw} "
+            f"filtered={dynamic_points_total_filtered} removed={removed}"
+        )
+    else:
+        dynamic_points_total_filtered = dynamic_points_total_raw
+        print("Dynamic denoise disabled")
+
+    for frame_idx, points in enumerate(dynamic_points_per_frame):
+        if frame_idx < len(index_rows):
+            index_rows[frame_idx]["num_dynamic_points"] = int(points.shape[0])
+
     full_bundle = {
         "splats": _clone_splats_to_cpu(splats),
         "rendered_intrinsics": predictions["rendered_intrinsics"].detach().cpu()
@@ -746,6 +988,13 @@ def run_static_dynamic_split(
         "use_motion": True,
         "dynamic_threshold": config.dynamic_threshold,
         "dynamic_threshold2": _resolved_dynamic_threshold2(config),
+        "dynamic_denoise_enabled": config.dynamic_denoise_enabled,
+        "dynamic_denoise_min_neighbors": int(config.dynamic_denoise_min_neighbors),
+        "dynamic_denoise_min_cluster_size": int(config.dynamic_denoise_min_cluster_size),
+        "dynamic_denoise_temporal_min_frames": int(config.dynamic_denoise_temporal_min_frames),
+        "dynamic_denoise_temporal_match_radius": float(config.dynamic_denoise_temporal_match_radius),
+        "dynamic_points_total_raw": int(dynamic_points_total_raw),
+        "dynamic_points_total_filtered": int(dynamic_points_total_filtered),
         "enable_global_motion_tracking": config.enable_global_motion_tracking,
         "static_classification": _static_classification_label(config),
         "static_point_count": int(static_points.shape[0]),

@@ -188,6 +188,16 @@ def parse_args():
                         help="world velocity threshold for static candidate classification")
     parser.add_argument("--dynamic_threshold2", type=float, default=None,
                         help="second world velocity threshold for global motion tracking")
+    parser.add_argument("--dynamic_denoise", action="store_true",
+                        help="enable optional denoise for exported dynamic points")
+    parser.add_argument("--dynamic_denoise_min_neighbors", type=int, default=1,
+                        help="minimum occupied 26-neighborhood voxels to keep a dynamic point")
+    parser.add_argument("--dynamic_denoise_min_cluster_size", type=int, default=12,
+                        help="minimum 26-connected dynamic cluster size to keep")
+    parser.add_argument("--dynamic_denoise_temporal_min_frames", type=int, default=1,
+                        help="minimum track length (in frames) for temporal dynamic denoise")
+    parser.add_argument("--dynamic_denoise_temporal_match_radius", type=float, default=0.06,
+                        help="centroid match radius for adjacent-frame temporal dynamic denoise")
     parser.add_argument("--enable_global_motion_tracking", action="store_true",
                         help="verify static candidates by camera reprojection consistency")
 
@@ -266,6 +276,11 @@ def main():
             dynamic_voxel_size=args.dynamic_voxel_size,
             dynamic_threshold=args.dynamic_threshold,
             dynamic_threshold2=args.dynamic_threshold2,
+            dynamic_denoise_enabled=args.dynamic_denoise,
+            dynamic_denoise_min_neighbors=args.dynamic_denoise_min_neighbors,
+            dynamic_denoise_min_cluster_size=args.dynamic_denoise_min_cluster_size,
+            dynamic_denoise_temporal_min_frames=args.dynamic_denoise_temporal_min_frames,
+            dynamic_denoise_temporal_match_radius=args.dynamic_denoise_temporal_match_radius,
             enable_global_motion_tracking=args.enable_global_motion_tracking,
         )
         split_result = run_static_dynamic_split(pipe=pipe, config=split_config, images=images)
@@ -351,6 +366,11 @@ def main():
             dynamic_voxel_size=args.dynamic_voxel_size,
             dynamic_threshold=args.dynamic_threshold,
             dynamic_threshold2=args.dynamic_threshold2,
+            dynamic_denoise_enabled=args.dynamic_denoise,
+            dynamic_denoise_min_neighbors=args.dynamic_denoise_min_neighbors,
+            dynamic_denoise_min_cluster_size=args.dynamic_denoise_min_cluster_size,
+            dynamic_denoise_temporal_min_frames=args.dynamic_denoise_temporal_min_frames,
+            dynamic_denoise_temporal_match_radius=args.dynamic_denoise_temporal_match_radius,
             enable_global_motion_tracking=args.enable_global_motion_tracking,
         )
 
