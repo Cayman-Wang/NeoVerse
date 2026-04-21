@@ -44,6 +44,16 @@ def parse_args():
                         help="minimum track length (in frames) for temporal dynamic denoise")
     parser.add_argument("--dynamic_denoise_temporal_match_radius", type=float, default=0.06,
                         help="centroid match radius for adjacent-frame temporal dynamic denoise")
+    parser.add_argument("--dynamic_depth_edge_filter", action="store_true",
+                        help="enable depth-edge halo filtering for dynamic points")
+    parser.add_argument("--dynamic_depth_edge_rel_threshold", type=float, default=0.05,
+                        help="relative depth jump threshold for depth-edge detection")
+    parser.add_argument("--dynamic_depth_edge_dilate", type=int, default=1,
+                        help="number of mask dilation passes for depth-edge detection")
+    parser.add_argument("--dynamic_depth_edge_neighbor_radius", type=int, default=2,
+                        help="2D neighborhood radius for dynamic point density check")
+    parser.add_argument("--dynamic_depth_edge_min_neighbors", type=int, default=2,
+                        help="minimum 2D neighbors required to keep an edge point")
     parser.add_argument("--enable_global_motion_tracking", action="store_true",
                         help="verify static candidates by camera reprojection consistency")
     return parser.parse_args()
@@ -53,8 +63,6 @@ def main():
     args = parse_args()
     from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
     from diffsynth.utils.static_dynamic_split import SplitConfig, run_static_dynamic_split
-
-    print(f"Loading NeoVerse reconstructor-only pipeline from {args.reconstructor_path}...")
 
     pipe = WanVideoNeoVersePipeline.from_reconstructor_only(
         reconstructor_path=args.reconstructor_path,
@@ -83,6 +91,11 @@ def main():
         dynamic_denoise_min_cluster_size=args.dynamic_denoise_min_cluster_size,
         dynamic_denoise_temporal_min_frames=args.dynamic_denoise_temporal_min_frames,
         dynamic_denoise_temporal_match_radius=args.dynamic_denoise_temporal_match_radius,
+        dynamic_depth_edge_filter=args.dynamic_depth_edge_filter,
+        dynamic_depth_edge_rel_threshold=args.dynamic_depth_edge_rel_threshold,
+        dynamic_depth_edge_dilate=args.dynamic_depth_edge_dilate,
+        dynamic_depth_edge_neighbor_radius=args.dynamic_depth_edge_neighbor_radius,
+        dynamic_depth_edge_min_neighbors=args.dynamic_depth_edge_min_neighbors,
         enable_global_motion_tracking=args.enable_global_motion_tracking,
     )
 

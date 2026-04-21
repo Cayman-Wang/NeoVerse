@@ -18,6 +18,7 @@ from ..auxiliary_models.worldmirror.models.models.rasterization import Gaussians
 
 STATIC_COLOR = np.array([160, 160, 160], dtype=np.float32)
 DYNAMIC_COLOR = np.array([255, 140, 0], dtype=np.float32)
+DEPTH_EDGE_DEPTH_GUARD_FORMULA = "abs(rendered_depth - point_z) <= 0.05 + 0.02 * rendered_depth"
 NEIGHBOR_OFFSETS_26 = [
     (dx, dy, dz)
     for dx in (-1, 0, 1)
@@ -48,6 +49,11 @@ class SplitConfig:
     dynamic_denoise_min_cluster_size: int = 12
     dynamic_denoise_temporal_min_frames: int = 1
     dynamic_denoise_temporal_match_radius: float = 0.06
+    dynamic_depth_edge_filter: bool = False
+    dynamic_depth_edge_rel_threshold: float = 0.05
+    dynamic_depth_edge_dilate: int = 1
+    dynamic_depth_edge_neighbor_radius: int = 2
+    dynamic_depth_edge_min_neighbors: int = 2
     enable_global_motion_tracking: bool = False
 
 
@@ -99,6 +105,223 @@ def configure_reconstructor_motion_split(pipe, config: SplitConfig) -> None:
 
 def _resolved_dynamic_threshold2(config: SplitConfig) -> float:
     return config.dynamic_threshold if config.dynamic_threshold2 is None else config.dynamic_threshold2
+
+
+def _project_points_with_indices(
+    points: np.ndarray,
+    K: np.ndarray,
+    world2cam: np.ndarray,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if points.shape[0] == 0:
+        empty_int = np.zeros(0, dtype=np.int64)
+        empty_float = np.zeros(0, dtype=np.float32)
+        return empty_int, empty_int.astype(np.int32), empty_int.astype(np.int32), empty_float
+
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    points_h = np.concatenate([points.astype(np.float32), ones], axis=1)
+    cam = (world2cam @ points_h.T).T[:, :3]
+    z = cam[:, 2]
+    valid_z = z > 1e-6
+    if not np.any(valid_z):
+        empty_int = np.zeros(0, dtype=np.int64)
+        empty_float = np.zeros(0, dtype=np.float32)
+        return empty_int, empty_int.astype(np.int32), empty_int.astype(np.int32), empty_float
+
+    valid_indices = np.where(valid_z)[0]
+    cam = cam[valid_z]
+    z = z[valid_z]
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    u = np.round((cam[:, 0] * fx / z) + cx).astype(np.int32)
+    v = np.round((cam[:, 1] * fy / z) + cy).astype(np.int32)
+    inside = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    return valid_indices[inside], u[inside], v[inside], z[inside]
+
+
+def _depth_edge_depth_tolerance(rendered_depth: np.ndarray) -> np.ndarray:
+    return 0.05 + 0.02 * rendered_depth
+
+
+def _dilate_binary_mask(mask: np.ndarray, iterations: int) -> np.ndarray:
+    if mask.size == 0:
+        return mask.astype(bool)
+    iterations = max(0, int(iterations))
+    result = mask.astype(bool)
+    for _ in range(iterations):
+        padded = np.pad(result, ((1, 1), (1, 1)), mode="constant", constant_values=False)
+        expanded = np.zeros_like(result, dtype=bool)
+        for dy in range(3):
+            for dx in range(3):
+                expanded |= padded[dy:dy + result.shape[0], dx:dx + result.shape[1]]
+        result = expanded
+    return result
+
+
+def _compute_depth_edge_mask(
+    depth_map: np.ndarray,
+    alpha_map: np.ndarray,
+    alpha_threshold: float,
+    rel_threshold: float,
+    dilate: int,
+) -> np.ndarray:
+    valid = (depth_map > 0) & (alpha_map > alpha_threshold)
+    edge_mask = np.zeros_like(valid, dtype=bool)
+
+    def mark_pair(y1: slice, y2: slice, x1: slice, x2: slice) -> None:
+        valid_a = valid[y1, x1]
+        valid_b = valid[y2, x2]
+        boundary = valid_a ^ valid_b
+        if np.any(boundary):
+            edge_mask[y1, x1] |= boundary
+            edge_mask[y2, x2] |= boundary
+
+        both_valid = valid_a & valid_b
+        if np.any(both_valid):
+            depth_a = depth_map[y1, x1][both_valid]
+            depth_b = depth_map[y2, x2][both_valid]
+            rel_jump = np.abs(depth_a - depth_b) / np.maximum(np.minimum(depth_a, depth_b), 1e-6)
+            jump = rel_jump > rel_threshold
+            if np.any(jump):
+                local_edge = np.zeros_like(valid_a, dtype=bool)
+                local_edge[both_valid] = jump
+                edge_mask[y1, x1] |= local_edge
+                edge_mask[y2, x2] |= local_edge
+
+    if depth_map.shape[0] > 1:
+        mark_pair(slice(0, -1), slice(1, None), slice(None), slice(None))
+    if depth_map.shape[1] > 1:
+        mark_pair(slice(None), slice(None), slice(0, -1), slice(1, None))
+
+    if dilate > 0:
+        edge_mask = _dilate_binary_mask(edge_mask, iterations=dilate)
+    return edge_mask
+
+
+def _projected_neighbor_counts(u: np.ndarray, v: np.ndarray, width: int, height: int, radius: int) -> np.ndarray:
+    if u.size == 0:
+        return np.zeros(0, dtype=np.int32)
+
+    radius = max(0, int(radius))
+    flat = v.astype(np.int64) * int(width) + u.astype(np.int64)
+    grid = np.bincount(flat, minlength=int(width) * int(height)).reshape(int(height), int(width))
+    integral = np.pad(grid, ((1, 0), (1, 0)), mode="constant", constant_values=0).cumsum(axis=0).cumsum(axis=1)
+
+    x0 = np.clip(u - radius, 0, width - 1)
+    x1 = np.clip(u + radius, 0, width - 1)
+    y0 = np.clip(v - radius, 0, height - 1)
+    y1 = np.clip(v + radius, 0, height - 1)
+    region_counts = (
+        integral[y1 + 1, x1 + 1]
+        - integral[y0, x1 + 1]
+        - integral[y1 + 1, x0]
+        + integral[y0, x0]
+    )
+    return (region_counts - 1).astype(np.int32)
+
+
+def _filter_dynamic_depth_edge_halo_frame(
+    points: np.ndarray,
+    K: np.ndarray,
+    world2cam: np.ndarray,
+    depth_map: np.ndarray,
+    alpha_map: np.ndarray,
+    alpha_threshold: float,
+    rel_threshold: float,
+    dilate: int,
+    neighbor_radius: int,
+    min_neighbors: int,
+) -> Tuple[np.ndarray, int]:
+    if points.shape[0] == 0:
+        return points.astype(np.float32), 0
+
+    height, width = depth_map.shape
+    point_indices, u, v, point_z = _project_points_with_indices(points, K, world2cam, width, height)
+    if point_indices.size == 0:
+        return points.astype(np.float32), 0
+
+    edge_mask = _compute_depth_edge_mask(
+        depth_map=depth_map,
+        alpha_map=alpha_map,
+        alpha_threshold=alpha_threshold,
+        rel_threshold=rel_threshold,
+        dilate=dilate,
+    )
+    edge_hits = edge_mask[v, u]
+    if not np.any(edge_hits):
+        return points.astype(np.float32), 0
+
+    neighbor_counts = _projected_neighbor_counts(u=u, v=v, width=width, height=height, radius=neighbor_radius)
+    sparse_hits = neighbor_counts < int(min_neighbors)
+    remove_candidates = edge_hits & sparse_hits
+    if not np.any(remove_candidates):
+        return points.astype(np.float32), 0
+
+    rendered_depth = depth_map[v, u]
+    rendered_alpha = alpha_map[v, u]
+    depth_valid = (rendered_depth > 0) & (rendered_alpha > alpha_threshold)
+    depth_inconsistent = ~depth_valid
+    if np.any(depth_valid):
+        tolerance = _depth_edge_depth_tolerance(rendered_depth[depth_valid])
+        depth_inconsistent[depth_valid] = np.abs(rendered_depth[depth_valid] - point_z[depth_valid]) > tolerance
+
+    remove_visible = remove_candidates & depth_inconsistent
+    if not np.any(remove_visible):
+        return points.astype(np.float32), 0
+
+    keep_mask = np.ones(points.shape[0], dtype=bool)
+    keep_mask[point_indices[remove_visible]] = False
+    filtered_points = points[keep_mask].astype(np.float32)
+    removed_count = int(points.shape[0] - filtered_points.shape[0])
+    return filtered_points, removed_count
+
+
+def _filter_dynamic_depth_edges_per_frame(
+    dynamic_points_per_frame: Sequence[np.ndarray],
+    splats: Sequence[Gaussians],
+    intrinsics: torch.Tensor,
+    cam2worlds: torch.Tensor,
+    frame_timestamps: Sequence[int],
+    pipe,
+    config: SplitConfig,
+) -> Tuple[List[np.ndarray], int, int]:
+    filtered_points_per_frame: List[np.ndarray] = []
+    points_before = 0
+    points_after = 0
+
+    for frame_idx, points in enumerate(dynamic_points_per_frame):
+        points_before += int(points.shape[0])
+        _, depth_map_t, alpha_map_t, world2cam_t = _render_depth_alpha(
+            pipe=pipe,
+            splats=splats,
+            K=intrinsics[frame_idx],
+            cam2world=cam2worlds[frame_idx],
+            timestamp=int(frame_timestamps[frame_idx]),
+            width=int(config.width),
+            height=int(config.height),
+        )
+        depth_map = depth_map_t.detach().cpu().float().numpy()
+        alpha_map = alpha_map_t.detach().cpu().float().numpy()
+        k_np = intrinsics[frame_idx].detach().cpu().float().numpy()
+        w2c_np = world2cam_t.detach().cpu().float().numpy()
+        filtered_points, _ = _filter_dynamic_depth_edge_halo_frame(
+            points=points,
+            K=k_np,
+            world2cam=w2c_np,
+            depth_map=depth_map,
+            alpha_map=alpha_map,
+            alpha_threshold=config.alpha_threshold,
+            rel_threshold=config.dynamic_depth_edge_rel_threshold,
+            dilate=config.dynamic_depth_edge_dilate,
+            neighbor_radius=config.dynamic_depth_edge_neighbor_radius,
+            min_neighbors=config.dynamic_depth_edge_min_neighbors,
+        )
+        filtered_points_per_frame.append(filtered_points)
+        points_after += int(filtered_points.shape[0])
+
+    return filtered_points_per_frame, points_before, points_after
 
 
 def _connected_components_26(coords: np.ndarray) -> List[np.ndarray]:
@@ -919,17 +1142,44 @@ def run_static_dynamic_split(
         gaussian_export_mode = "mask_snapshot_audit"
 
     dynamic_points_total_raw = int(sum(points.shape[0] for points in dynamic_points_per_frame))
+    dynamic_points_total_after_denoise = dynamic_points_total_raw
     if config.dynamic_denoise_enabled:
         dynamic_points_per_frame = _denoise_dynamic_points_per_frame(dynamic_points_per_frame, config)
-        dynamic_points_total_filtered = int(sum(points.shape[0] for points in dynamic_points_per_frame))
-        removed = dynamic_points_total_raw - dynamic_points_total_filtered
+        dynamic_points_total_after_denoise = int(sum(points.shape[0] for points in dynamic_points_per_frame))
+        removed = dynamic_points_total_raw - dynamic_points_total_after_denoise
         print(
             f"Dynamic denoise: raw={dynamic_points_total_raw} "
-            f"filtered={dynamic_points_total_filtered} removed={removed}"
+            f"filtered={dynamic_points_total_after_denoise} removed={removed}"
         )
     else:
-        dynamic_points_total_filtered = dynamic_points_total_raw
         print("Dynamic denoise disabled")
+
+    dynamic_points_total_after_depth_edge = dynamic_points_total_after_denoise
+    dynamic_depth_edge_removed = 0
+    if config.dynamic_depth_edge_filter:
+        dynamic_points_per_frame, points_before_depth_edge, points_after_depth_edge = _filter_dynamic_depth_edges_per_frame(
+            dynamic_points_per_frame=dynamic_points_per_frame,
+            splats=splats,
+            intrinsics=intrinsics,
+            cam2worlds=cam2worlds,
+            frame_timestamps=frame_timestamps,
+            pipe=pipe,
+            config=config,
+        )
+        dynamic_points_total_after_depth_edge = points_after_depth_edge
+        dynamic_depth_edge_removed = points_before_depth_edge - points_after_depth_edge
+        print(
+            f"Dynamic depth-edge filter: before={points_before_depth_edge} "
+            f"after={points_after_depth_edge} removed={dynamic_depth_edge_removed} "
+            f"rel_threshold={config.dynamic_depth_edge_rel_threshold} "
+            f"dilate={config.dynamic_depth_edge_dilate} "
+            f"radius={config.dynamic_depth_edge_neighbor_radius} "
+            f"min_neighbors={config.dynamic_depth_edge_min_neighbors}"
+        )
+    else:
+        print("Dynamic depth-edge filter disabled")
+
+    dynamic_points_total_filtered = dynamic_points_total_after_depth_edge
 
     for frame_idx, points in enumerate(dynamic_points_per_frame):
         if frame_idx < len(index_rows):
@@ -994,6 +1244,16 @@ def run_static_dynamic_split(
         "dynamic_denoise_temporal_min_frames": int(config.dynamic_denoise_temporal_min_frames),
         "dynamic_denoise_temporal_match_radius": float(config.dynamic_denoise_temporal_match_radius),
         "dynamic_points_total_raw": int(dynamic_points_total_raw),
+        "dynamic_points_total_after_denoise": int(dynamic_points_total_after_denoise),
+        "dynamic_depth_edge_filter_enabled": config.dynamic_depth_edge_filter,
+        "dynamic_depth_edge_rel_threshold": float(config.dynamic_depth_edge_rel_threshold),
+        "dynamic_depth_edge_dilate": int(config.dynamic_depth_edge_dilate),
+        "dynamic_depth_edge_neighbor_radius": int(config.dynamic_depth_edge_neighbor_radius),
+        "dynamic_depth_edge_min_neighbors": int(config.dynamic_depth_edge_min_neighbors),
+        "dynamic_depth_edge_depth_guard_enabled": bool(config.dynamic_depth_edge_filter),
+        "dynamic_depth_edge_depth_guard_formula": DEPTH_EDGE_DEPTH_GUARD_FORMULA,
+        "dynamic_points_total_after_depth_edge": int(dynamic_points_total_after_depth_edge),
+        "dynamic_depth_edge_removed": int(dynamic_depth_edge_removed),
         "dynamic_points_total_filtered": int(dynamic_points_total_filtered),
         "enable_global_motion_tracking": config.enable_global_motion_tracking,
         "static_classification": _static_classification_label(config),

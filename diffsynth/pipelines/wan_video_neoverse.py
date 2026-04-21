@@ -305,16 +305,27 @@ class WanVideoNeoVersePipeline(BasePipeline):
 
         pipe = WanVideoNeoVersePipeline(device=device, torch_dtype=torch_dtype)
 
+        if not os.path.exists(reconstructor_path):
+            raise RuntimeError(f"Reconstructor path does not exist: {reconstructor_path}")
+
         model_manager = ModelManager()
-        model_manager.load_model(
-            reconstructor_path,
-            device="cpu" if enable_vram_management else device,
-            torch_dtype=torch_dtype,
-        )
+        try:
+            model_manager.load_model(
+                reconstructor_path,
+                device="cpu" if enable_vram_management else device,
+                torch_dtype=torch_dtype,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load reconstructor weights from {reconstructor_path}: {e}"
+            ) from e
         pipe.reconstructor = model_manager.fetch_model("reconstructor")
 
         if pipe.reconstructor is None:
-            raise RuntimeError(f"Failed to load reconstructor from {reconstructor_path}")
+            raise RuntimeError(
+                f"Failed to load reconstructor from {reconstructor_path}. "
+                f"Detected models: {model_manager.model_name}"
+            )
 
         pipe.dit = None
         pipe.text_encoder = None

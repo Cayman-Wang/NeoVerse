@@ -198,6 +198,291 @@ python inference.py --trajectory_file my_trajectory.json --validate_only
 
 **低显存模式**（`--low_vram`）—— 通过模型卸载减少 GPU 峰值显存占用。启用后，模型保留在 CPU 上，仅在需要时加载到 GPU（例如，重建时加载重建器，完成后卸载；去噪时加载扩散模型，完成后再卸载）。这会显著降低峰值 VRAM，但由于 CPU-GPU 数据传输，推理速度会变慢。默认模式下 GPU 上约分配 47 GB（`torch.cuda.memory_allocated`），峰值约 74 GB（`torch.cuda.max_memory_allocated`）；而 `--low_vram` 仅保持约 1 GB 分配，峰值降低到约 38 GB。
 
+### 单目动静分离导出
+
+NeoVerse 也支持将重建结果导出为**静态背景点云**与**逐帧动态点云**，便于做可视化检查、点云后处理或下游碰撞几何生成。
+
+目前提供两个入口：
+
+- `python scripts/split_static_dynamic.py`：只做动静分离导出。该入口使用 **reconstructor-only** 路径，不会加载完整的视频生成模型，适合做分离诊断与点云导出。
+- `python inference.py --export_static_dynamic_split`：在常规推理后附带导出动静分离结果。
+- `python inference.py --split_only --export_static_dynamic_split`：只导出动静分离结果，不生成 `output.mp4`，同样走 **reconstructor-only** 路径。
+
+#### 快速开始
+
+```bash
+# 只导出动静分离结果
+python scripts/split_static_dynamic.py \
+    --input_path examples/videos/driving.mp4 \
+    --output_dir outputs/split/driving_motion \
+    --split_mode motion \
+    --num_frames 81 \
+    --width 560 \
+    --height 336 \
+    --resize_mode center_crop \
+    --low_vram
+```
+
+```bash
+# 在 inference.py 中只导出 split 结果，不生成新视角视频
+python inference.py \
+    --split_only \
+    --export_static_dynamic_split \
+    --input_path examples/videos/driving2.mp4 \
+    --split_output_dir outputs/split/driving2_only \
+    --split_mode motion \
+    --num_frames 81 \
+    --width 560 \
+    --height 336 \
+    --resize_mode center_crop \
+    --low_vram
+```
+
+```bash
+# 正常生成视频，同时附带导出 split 结果
+python inference.py \
+    --trajectory static \
+    --input_path examples/videos/driving2.mp4 \
+    --output_path outputs/driving2_static.mp4 \
+    --export_static_dynamic_split \
+    --split_output_dir outputs/split/driving2_with_video \
+    --split_mode motion
+```
+
+#### 输出目录结构
+
+典型输出如下：
+
+```
+outputs/split/driving_motion/
+├── points/
+│   ├── static_world.npy
+│   ├── index.csv
+│   └── dynamic_by_timestamp/
+│       ├── 000000.npy
+│       └── ...
+├── gaussians/
+│   ├── static.pt
+│   ├── full.pt
+│   ├── dynamic.pt              # motion 模式
+│   └── dynamic_by_timestamp/   # mask 模式的逐帧 snapshot
+├── preview/
+│   ├── overlay.mp4
+│   ├── static.mp4
+│   └── dynamic.mp4
+└── split_meta.json
+```
+
+各产物含义如下：
+
+- `points/static_world.npy`：世界坐标系下的静态背景点云。
+- `points/dynamic_by_timestamp/*.npy`：每个时间戳对应的动态点云，这是最适合做后续碰撞 mesh 或点云清理的输入。
+- `points/index.csv`：逐帧索引，记录 `timestamp`、对应 `.npy` 路径和动态点数。
+- `gaussians/static.pt`：静态高斯。
+- `gaussians/dynamic.pt`：`motion` 模式下的原始动态高斯审计结果；**不会**因为导出时的动态点去噪而改变。
+- `gaussians/dynamic_by_timestamp/*.pt`：`mask` 模式下的逐帧动态高斯 snapshot。
+- `gaussians/full.pt`：完整重建 bundle，包含 splats、渲染相机参数与 split 元数据。
+- `preview/overlay.mp4`：原视频背景 + 静态灰点 + 动态橙点。
+- `preview/static.mp4`：黑底 + 静态灰点。
+- `preview/dynamic.mp4`：黑底 + 动态橙点，最适合人工观察动态点是否干净。
+- `split_meta.json`：本次导出的关键配置与统计信息，例如 `split_mode_effective`、`dynamic_threshold`、`dynamic_points_total_filtered` 等。
+
+#### 模式说明
+
+`--split_mode` 控制动静分离使用哪条路径：
+
+| 模式 | 含义 | 适用场景 |
+|------|------|----------|
+| `motion` | 依据重建器输出的运动信息做动静分离 | 默认推荐，适合没有 mask 的普通视频 |
+| `mask` | 使用 `--mask_dir` 中的逐帧二值 mask 做动静分离 | 你已经有较可靠前景掩码时 |
+| `auto` | 若提供了有效 `--mask_dir` 则走 `mask`，否则回退到 `motion` | 想兼容两种数据来源时 |
+
+说明：
+
+- `split_mode=mask` 必须提供 `--mask_dir`，目录中应包含形如 `000000.png` 的逐帧掩码。
+- `split_mode=auto` 在没有 `--mask_dir` 时会自动退回 `motion`，实际使用的模式会记录在 `split_meta.json` 的 `split_mode_effective` 字段中。
+
+#### 核心参数与含义
+
+##### 1）采样与分辨率
+
+| 参数 | 含义 | 调整建议 |
+|------|------|----------|
+| `--num_frames` | 参与重建和导出的帧数 | 越大时序更完整，但显存和耗时更高 |
+| `--width` / `--height` | 输入视频重采样分辨率 | 越高细节越多，但显存占用更高 |
+| `--resize_mode` | `center_crop` 或 `resize` | 一般推荐 `center_crop`，避免几何比例被拉伸 |
+| `--static_scene` | 静态场景模式 | 单张图片或相机完全静止的视频再开启 |
+| `--low_vram` | 低显存模式 | 显存吃紧时建议开启，速度会变慢 |
+
+经验建议：
+
+- 建议 `--width` 和 `--height` 选择与重建器 patch 对齐兼容的尺寸，实践中推荐使用 **14 的倍数**，例如 `420x252`、`560x336`、`640x384`。
+- 如果只是先确认流程能跑通，可优先从较低分辨率和较少帧数开始，例如 `8` 帧或 `420x252`。
+
+##### 2）motion 模式下的动静判定
+
+| 参数 | 含义 | 影响 |
+|------|------|------|
+| `--dynamic_threshold` | 世界坐标系速度阈值，用于区分静态候选与动态候选 | 越小越容易判为动态；越大越保守 |
+| `--dynamic_threshold2` | 第二阈值，供全局运动跟踪逻辑使用 | 一般不单独设置，默认跟随 `dynamic_threshold` |
+| `--enable_global_motion_tracking` | 开启基于相机重投影一致性的额外检查 | 能减少因相机运动带来的静态误判，但会更保守 |
+
+如何理解 `dynamic_threshold`：
+
+- 它衡量的是**点在世界坐标系中的运动速度**，不是图像平面上的像素位移。
+- 阈值过小：车辆能更完整地被判为动态，但天空、背景边缘、远处结构更容易混入动态。
+- 阈值过大：动态误检会减少，但车辆和行人轮廓可能被削弱。
+
+在我们当前的经验设置中：
+
+- `scene_d78_3rd.mp4` 更适合 `--dynamic_threshold 0.00014`
+- `shaky_video.mp4` 更适合 `--dynamic_threshold 0.00015`
+
+##### 3）动态点云去噪
+
+`--dynamic_denoise` 会在导出 `.npy` 前，对动态点云做一次**空间 + 时间**过滤，不会修改高斯审计文件（如 `gaussians/dynamic.pt` 或 `gaussians/dynamic_by_timestamp/*.pt`）。
+
+| 参数 | 含义 | 典型效果 |
+|------|------|----------|
+| `--dynamic_denoise` | 开启动态点去噪 | 去掉明显的小孤立簇 |
+| `--dynamic_denoise_min_neighbors` | 体素点至少需要多少个 26 邻域占据邻居 | 越大越严格 |
+| `--dynamic_denoise_min_cluster_size` | 保留动态簇的最小连通域大小 | 越大越容易去掉小散点 |
+| `--dynamic_denoise_temporal_min_frames` | 动态簇至少连续出现多少帧才保留 | 越大越能抑制闪烁噪点 |
+| `--dynamic_denoise_temporal_match_radius` | 相邻帧簇质心匹配半径 | 越小越严格，越大越容易把不同簇连起来 |
+
+一组常用的起点参数（常被称为 “n1” 风格）：
+
+```bash
+--dynamic_denoise \
+--dynamic_denoise_min_neighbors 1 \
+--dynamic_denoise_min_cluster_size 12
+```
+
+如果想进一步压制短暂噪点，可加入时间约束，例如：
+
+```bash
+--dynamic_denoise \
+--dynamic_denoise_min_neighbors 1 \
+--dynamic_denoise_min_cluster_size 12 \
+--dynamic_denoise_temporal_min_frames 2 \
+--dynamic_denoise_temporal_match_radius 0.06
+```
+
+##### 4）depth-edge 光晕过滤
+
+针对大块动态簇周围常见的“边缘光晕”黄点，可开启 `--dynamic_depth_edge_filter`。它会在动态点去噪之后，对**落在深度边缘附近且局部稀疏**的动态点进行额外清理。
+
+| 参数 | 含义 | 调整建议 |
+|------|------|----------|
+| `--dynamic_depth_edge_filter` | 开启 depth-edge 过滤 | 想让 `dynamic_by_timestamp/*.npy` 更干净时开启 |
+| `--dynamic_depth_edge_rel_threshold` | 判定深度边界的相对深度跳变阈值 | 越小越激进，越大越保守 |
+| `--dynamic_depth_edge_dilate` | 深度边界膨胀次数 | 越大覆盖的边缘带越宽 |
+| `--dynamic_depth_edge_neighbor_radius` | 2D 像素邻域半径 | 越大越倾向保留局部成团的边缘点 |
+| `--dynamic_depth_edge_min_neighbors` | 一个边缘点至少需要多少个 2D 邻居才保留 | 越大越容易去掉稀疏黄点 |
+
+当前实现中还额外内置了一层**深度一致性保护**，避免把真实车辆轮廓上的点误删。其规则会写入 `split_meta.json`：
+
+```text
+abs(rendered_depth - point_z) <= 0.05 + 0.02 * rendered_depth
+```
+
+也就是说，只有当一个动态点同时满足：
+
+1. 落在深度边缘附近；
+2. 局部 2D 邻域比较稀疏；
+3. 与当前渲染深度不一致；
+
+才会被过滤掉。
+
+一组推荐起点参数：
+
+```bash
+--dynamic_depth_edge_filter \
+--dynamic_depth_edge_rel_threshold 0.05 \
+--dynamic_depth_edge_dilate 1 \
+--dynamic_depth_edge_neighbor_radius 2 \
+--dynamic_depth_edge_min_neighbors 2
+```
+
+#### 推荐命令
+
+##### 先确认流程能跑通
+
+```bash
+python scripts/split_static_dynamic.py \
+    --input_path examples/videos/driving.mp4 \
+    --output_dir outputs/split/driving_smoke \
+    --split_mode motion \
+    --num_frames 8 \
+    --width 420 \
+    --height 252 \
+    --resize_mode center_crop \
+    --low_vram
+```
+
+##### 导出更干净的动态点云
+
+```bash
+python scripts/split_static_dynamic.py \
+    --input_path examples/videos/scene_d78_3rd.mp4 \
+    --output_dir outputs/split/scene_d78_clean \
+    --split_mode motion \
+    --num_frames 81 \
+    --width 420 \
+    --height 252 \
+    --resize_mode center_crop \
+    --low_vram \
+    --dynamic_threshold 0.00014 \
+    --dynamic_denoise \
+    --dynamic_denoise_min_neighbors 1 \
+    --dynamic_denoise_min_cluster_size 12 \
+    --dynamic_depth_edge_filter \
+    --dynamic_depth_edge_rel_threshold 0.05 \
+    --dynamic_depth_edge_dilate 1 \
+    --dynamic_depth_edge_neighbor_radius 2 \
+    --dynamic_depth_edge_min_neighbors 2
+```
+
+##### 对抖动更强的视频增加时间约束
+
+```bash
+python scripts/split_static_dynamic.py \
+    --input_path examples/videos/shaky_video.mp4 \
+    --output_dir outputs/split/shaky_clean \
+    --split_mode motion \
+    --num_frames 81 \
+    --width 420 \
+    --height 252 \
+    --resize_mode center_crop \
+    --low_vram \
+    --dynamic_threshold 0.00015 \
+    --dynamic_denoise \
+    --dynamic_denoise_min_neighbors 1 \
+    --dynamic_denoise_min_cluster_size 12 \
+    --dynamic_denoise_temporal_min_frames 2 \
+    --dynamic_denoise_temporal_match_radius 0.06 \
+    --dynamic_depth_edge_filter \
+    --dynamic_depth_edge_rel_threshold 0.05 \
+    --dynamic_depth_edge_dilate 1 \
+    --dynamic_depth_edge_neighbor_radius 2 \
+    --dynamic_depth_edge_min_neighbors 2
+```
+
+#### 如何读 `preview/`
+
+导出完成后，建议重点看这三个预览：
+
+- `preview/overlay.mp4`：看动静分层是否贴合原视频内容；
+- `preview/static.mp4`：看灰点是否主要覆盖背景；
+- `preview/dynamic.mp4`：看橙点是否主要覆盖车辆、行人等动态目标，以及是否还有明显的边缘光晕。
+
+如果 `dynamic.mp4` 中出现以下现象，可按对应方向调整：
+
+- **整片天空、远处结构变成橙色**：适当调大 `--dynamic_threshold`，或开启 `--dynamic_depth_edge_filter`
+- **车辆边缘丢失太多**：减弱 `depth-edge` 过滤，或回退到只开 `--dynamic_denoise`
+- **动态点周围有很多小黄点**：开启 `--dynamic_denoise`，并适度提高 `--dynamic_denoise_min_cluster_size`
+- **动态点边缘有一圈“光晕”**：开启 `--dynamic_depth_edge_filter`
+
 ### 交互式 Demo（Gradio）
 
 启动 Web UI：
