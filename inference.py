@@ -184,6 +184,12 @@ def parse_args():
                         help="voxel size in neoverse_scene_unit")
     parser.add_argument("--dynamic_voxel_size", type=float, default=0.01,
                         help="voxel size in neoverse_scene_unit")
+    parser.add_argument("--dynamic_threshold", type=float, default=1e-4,
+                        help="world velocity threshold for static candidate classification")
+    parser.add_argument("--dynamic_threshold2", type=float, default=None,
+                        help="second world velocity threshold for global motion tracking")
+    parser.add_argument("--enable_global_motion_tracking", action="store_true",
+                        help="verify static candidates by camera reprojection consistency")
 
     return parser.parse_args()
 
@@ -258,6 +264,9 @@ def main():
             alpha_threshold=args.split_alpha_threshold,
             static_voxel_size=args.static_voxel_size,
             dynamic_voxel_size=args.dynamic_voxel_size,
+            dynamic_threshold=args.dynamic_threshold,
+            dynamic_threshold2=args.dynamic_threshold2,
+            enable_global_motion_tracking=args.enable_global_motion_tracking,
         )
         split_result = run_static_dynamic_split(pipe=pipe, config=split_config, images=images)
         print(f"Static/dynamic split done: {split_result['output_dir']}")
@@ -327,10 +336,6 @@ def main():
         else:
             split_output_dir = os.path.splitext(args.output_path)[0] + "_split"
 
-        precomputed_views = build_split_views(images=images, device=pipe.device, static_scene=args.static_scene)
-        precomputed_predictions = run_split_reconstruction(pipe=pipe, views=precomputed_views, use_motion=True)
-
-        print(f"Exporting static/dynamic split to {split_output_dir}...")
         split_config = SplitConfig(
             input_path=args.input_path,
             output_dir=split_output_dir,
@@ -344,7 +349,20 @@ def main():
             alpha_threshold=args.split_alpha_threshold,
             static_voxel_size=args.static_voxel_size,
             dynamic_voxel_size=args.dynamic_voxel_size,
+            dynamic_threshold=args.dynamic_threshold,
+            dynamic_threshold2=args.dynamic_threshold2,
+            enable_global_motion_tracking=args.enable_global_motion_tracking,
         )
+
+        precomputed_views = build_split_views(images=images, device=pipe.device, static_scene=args.static_scene)
+        precomputed_predictions = run_split_reconstruction(
+            pipe=pipe,
+            views=precomputed_views,
+            use_motion=True,
+            config=split_config,
+        )
+
+        print(f"Exporting static/dynamic split to {split_output_dir}...")
         split_result = run_static_dynamic_split(
             pipe=pipe,
             config=split_config,

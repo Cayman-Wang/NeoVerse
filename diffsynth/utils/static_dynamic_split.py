@@ -33,6 +33,9 @@ class SplitConfig:
     alpha_threshold: float = 0.05
     static_voxel_size: float = 0.01
     dynamic_voxel_size: float = 0.01
+    dynamic_threshold: float = 1e-4
+    dynamic_threshold2: Optional[float] = None
+    enable_global_motion_tracking: bool = False
 
 
 @dataclass
@@ -42,16 +45,53 @@ class SplitOutputs:
     static_points: np.ndarray
     dynamic_points_per_frame: List[np.ndarray]
     preview_path: str
-    gaussian_export_mode: str
-    fallback_reason: Optional[str]
+    gaussian_export_mode: str = ""
+    fallback_reason: Optional[str] = None
+    overlay_preview_path: Optional[str] = None
+    static_preview_path: Optional[str] = None
+    dynamic_preview_path: Optional[str] = None
 
 
 def build_split_views(images: Sequence[Image.Image], device: str, static_scene: bool) -> dict:
     return _build_views(images=images, device=device, static_scene=static_scene)
 
 
-def run_split_reconstruction(pipe, views: dict, use_motion: bool = True) -> dict:
+def run_split_reconstruction(pipe, views: dict, use_motion: bool = True, config: Optional[SplitConfig] = None) -> dict:
+    if config is not None:
+        configure_reconstructor_motion_split(pipe=pipe, config=config)
     return _run_reconstruction(pipe=pipe, views=views, use_motion=use_motion)
+
+
+def configure_reconstructor_motion_split(pipe, config: SplitConfig) -> None:
+    reconstructor = getattr(pipe, "reconstructor", None)
+    if reconstructor is None:
+        raise RuntimeError("Cannot configure motion split without pipe.reconstructor")
+
+    dynamic_threshold2 = (
+        config.dynamic_threshold
+        if config.dynamic_threshold2 is None
+        else config.dynamic_threshold2
+    )
+
+    reconstructor.dynamic_threshold = config.dynamic_threshold
+    reconstructor.dynamic_threshold2 = dynamic_threshold2
+    reconstructor.enable_global_motion_tracking = config.enable_global_motion_tracking
+
+    renderer = getattr(reconstructor, "gs_renderer", None)
+    if renderer is not None:
+        renderer.dynamic_threshold = config.dynamic_threshold
+        renderer.dynamic_threshold2 = dynamic_threshold2
+        renderer.global_motion_tracking = config.enable_global_motion_tracking
+
+
+def _resolved_dynamic_threshold2(config: SplitConfig) -> float:
+    return config.dynamic_threshold if config.dynamic_threshold2 is None else config.dynamic_threshold2
+
+
+def _static_classification_label(config: SplitConfig) -> str:
+    if config.enable_global_motion_tracking:
+        return "world_velocity_threshold+camera_reprojection_check"
+    return "world_velocity_threshold"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -200,17 +240,38 @@ def _project_points(points: np.ndarray, K: np.ndarray, world2cam: np.ndarray, wi
     return u[inside], v[inside], z[inside]
 
 
-def _overlay_points(frame: Image.Image, static_points: np.ndarray, dynamic_points: np.ndarray, K: np.ndarray, world2cam: np.ndarray) -> Image.Image:
-    arr = np.array(frame.convert("RGB"), dtype=np.float32)
+def _compose_preview_frame(
+    frame: Image.Image,
+    static_points: np.ndarray,
+    dynamic_points: np.ndarray,
+    K: np.ndarray,
+    world2cam: np.ndarray,
+    use_input_background: bool,
+    draw_static: bool,
+    draw_dynamic: bool,
+) -> Image.Image:
+    if use_input_background:
+        arr = np.array(frame.convert("RGB"), dtype=np.float32)
+    else:
+        h0, w0 = frame.size[1], frame.size[0]
+        arr = np.zeros((h0, w0, 3), dtype=np.float32)
     h, w = arr.shape[:2]
 
-    u_s, v_s, _ = _project_points(static_points, K, world2cam, w, h)
-    if u_s.size > 0:
-        arr[v_s, u_s] = arr[v_s, u_s] * 0.4 + STATIC_COLOR * 0.6
+    if draw_static:
+        u_s, v_s, _ = _project_points(static_points, K, world2cam, w, h)
+        if u_s.size > 0:
+            if use_input_background:
+                arr[v_s, u_s] = arr[v_s, u_s] * 0.4 + STATIC_COLOR * 0.6
+            else:
+                arr[v_s, u_s] = STATIC_COLOR
 
-    u_d, v_d, _ = _project_points(dynamic_points, K, world2cam, w, h)
-    if u_d.size > 0:
-        arr[v_d, u_d] = arr[v_d, u_d] * 0.2 + DYNAMIC_COLOR * 0.8
+    if draw_dynamic:
+        u_d, v_d, _ = _project_points(dynamic_points, K, world2cam, w, h)
+        if u_d.size > 0:
+            if use_input_background:
+                arr[v_d, u_d] = arr[v_d, u_d] * 0.2 + DYNAMIC_COLOR * 0.8
+            else:
+                arr[v_d, u_d] = DYNAMIC_COLOR
 
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
@@ -466,30 +527,84 @@ def _split_mask(
     return static_points, dynamic_points_per_frame, dynamic_gaussians_per_frame, index_rows, static_candidates
 
 
+def _save_preview_frames(frames: Sequence[Image.Image], output_preview_path: Path) -> str:
+    _ensure_dir(output_preview_path.parent)
+    if len(frames) == 1:
+        path = output_preview_path.with_suffix(".png")
+        frames[0].save(path)
+        return str(path)
+
+    from .. import save_video
+
+    path = output_preview_path.with_suffix(".mp4")
+    save_video(list(frames), str(path), fps=16)
+    return str(path)
+
+
 def _render_preview(
     images: Sequence[Image.Image],
     static_points: np.ndarray,
     dynamic_points_per_frame: Sequence[np.ndarray],
     intrinsics: torch.Tensor,
     cam2worlds: torch.Tensor,
-    output_preview_path: Path,
-):
-    preview_frames: List[Image.Image] = []
+    output_preview_dir: Path,
+) -> dict:
+    overlay_frames: List[Image.Image] = []
+    static_frames: List[Image.Image] = []
+    dynamic_frames: List[Image.Image] = []
+
     for idx, image in enumerate(images):
         K = intrinsics[idx].detach().cpu().float().numpy()
         world2cam = homo_matrix_inverse(cam2worlds[idx][None])[0].detach().cpu().float().numpy()
         dynamic_points = dynamic_points_per_frame[idx] if idx < len(dynamic_points_per_frame) else np.zeros((0, 3), dtype=np.float32)
-        preview_frames.append(_overlay_points(image, static_points, dynamic_points, K, world2cam))
+        overlay_frames.append(
+            _compose_preview_frame(
+                frame=image,
+                static_points=static_points,
+                dynamic_points=dynamic_points,
+                K=K,
+                world2cam=world2cam,
+                use_input_background=True,
+                draw_static=True,
+                draw_dynamic=True,
+            )
+        )
+        static_frames.append(
+            _compose_preview_frame(
+                frame=image,
+                static_points=static_points,
+                dynamic_points=np.zeros((0, 3), dtype=np.float32),
+                K=K,
+                world2cam=world2cam,
+                use_input_background=False,
+                draw_static=True,
+                draw_dynamic=False,
+            )
+        )
+        dynamic_frames.append(
+            _compose_preview_frame(
+                frame=image,
+                static_points=np.zeros((0, 3), dtype=np.float32),
+                dynamic_points=dynamic_points,
+                K=K,
+                world2cam=world2cam,
+                use_input_background=False,
+                draw_static=False,
+                draw_dynamic=True,
+            )
+        )
 
-    _ensure_dir(output_preview_path.parent)
-    if len(preview_frames) == 1:
-        preview_frames[0].save(output_preview_path.with_suffix(".png"))
-        return str(output_preview_path.with_suffix(".png"))
+    overlay_path = _save_preview_frames(overlay_frames, output_preview_dir / "overlay")
+    static_path = _save_preview_frames(static_frames, output_preview_dir / "static")
+    dynamic_path = _save_preview_frames(dynamic_frames, output_preview_dir / "dynamic")
+    print("Saved previews: overlay, static, dynamic")
 
-    from .. import save_video
-
-    save_video(preview_frames, str(output_preview_path.with_suffix(".mp4")), fps=16)
-    return str(output_preview_path.with_suffix(".mp4"))
+    return {
+        "preview_path": overlay_path,
+        "overlay_preview_path": overlay_path,
+        "static_preview_path": static_path,
+        "dynamic_preview_path": dynamic_path,
+    }
 
 
 @torch.no_grad()
@@ -523,6 +638,7 @@ def run_static_dynamic_split(
         raise ValueError("No sampled frames found from input")
 
     if predictions is None:
+        configure_reconstructor_motion_split(pipe=pipe, config=config)
         if views is None:
             views = _build_views(images, device=pipe.device, static_scene=config.static_scene)
         predictions = _run_reconstruction(pipe, views, use_motion=True)
@@ -595,6 +711,10 @@ def run_static_dynamic_split(
         "height": config.height,
         "resize_mode": config.resize_mode,
         "use_motion": True,
+        "dynamic_threshold": config.dynamic_threshold,
+        "dynamic_threshold2": _resolved_dynamic_threshold2(config),
+        "enable_global_motion_tracking": config.enable_global_motion_tracking,
+        "static_classification": _static_classification_label(config),
         "split_mode_requested": config.split_mode,
         "split_mode_effective": effective_mode,
     }
@@ -606,13 +726,13 @@ def run_static_dynamic_split(
 
     _save_points_index(points_root / "index.csv", index_rows)
 
-    preview_path = _render_preview(
+    preview_paths = _render_preview(
         images=images,
         static_points=static_points,
         dynamic_points_per_frame=dynamic_points_per_frame,
         intrinsics=intrinsics,
         cam2worlds=cam2worlds,
-        output_preview_path=output_root / "preview" / "overlay",
+        output_preview_dir=output_root / "preview",
     )
 
     nonempty_dynamic_frames = sum(int(points.shape[0] > 0) for points in dynamic_points_per_frame)
@@ -624,11 +744,18 @@ def run_static_dynamic_split(
         "split_mode_effective": effective_mode,
         "has_mask_dir": bool(config.mask_dir),
         "use_motion": True,
+        "dynamic_threshold": config.dynamic_threshold,
+        "dynamic_threshold2": _resolved_dynamic_threshold2(config),
+        "enable_global_motion_tracking": config.enable_global_motion_tracking,
+        "static_classification": _static_classification_label(config),
         "static_point_count": int(static_points.shape[0]),
         "nonempty_dynamic_frames": int(nonempty_dynamic_frames),
         "gaussian_export_mode": gaussian_export_mode,
         "coordinate_unit": "neoverse_scene_unit",
-        "preview_path": os.path.relpath(preview_path, start=str(output_root)),
+        "preview_path": os.path.relpath(preview_paths["preview_path"], start=str(output_root)),
+        "overlay_preview_path": os.path.relpath(preview_paths["overlay_preview_path"], start=str(output_root)),
+        "static_preview_path": os.path.relpath(preview_paths["static_preview_path"], start=str(output_root)),
+        "dynamic_preview_path": os.path.relpath(preview_paths["dynamic_preview_path"], start=str(output_root)),
     }
     if fallback_reason is not None:
         meta["split_mode_fallback_reason"] = fallback_reason
